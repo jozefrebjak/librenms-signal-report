@@ -1,12 +1,14 @@
 #!/bin/bash
 # LibreNMS NOC alert report
-# Fetches active alerts and prints a Signal-friendly summary.
+# Fetches active alerts, checks the LibreNMS TLS certificate expiry and prints
+# a Signal-friendly summary.
 # PROJECT_GROUP is shown in the header only — it does not filter alerts.
 #
 # Usage:
 #   ./noc-report.sh                  # use .env in script directory
 #   ENV_FILE=/path/to/.env ./noc-report.sh
 #   PROJECT_GROUP=WARP ./noc-report.sh   # only changes the header label
+#   SSL_CHECK=0 ./noc-report.sh          # skip the certificate check
 
 set -euo pipefail
 
@@ -35,6 +37,13 @@ fi
 PROJECT_GROUP="${PROJECT_GROUP:-}"
 ALERT_STATE="${ALERT_STATE:-1}"
 ALERT_SEVERITY="${ALERT_SEVERITY:-}"
+
+# Optional — TLS certificate check for LIBRENMS_URL
+SSL_CHECK="${SSL_CHECK:-1}"
+SSL_WARN_DAYS="${SSL_WARN_DAYS:-14}"
+SSL_CRIT_DAYS="${SSL_CRIT_DAYS:-7}"
+SSL_TIMEOUT="${SSL_TIMEOUT:-10}"
+SSL_MANAGER_HINT="${SSL_MANAGER_HINT:-Manual renewal required via ssl-manager}"
 
 # Strip trailing slash from URLs
 LIBRENMS_URL="${LIBRENMS_URL%/}"
@@ -77,6 +86,79 @@ severity_label() {
         ok)       echo "✅ OK" ;;
         *)        echo "❓ UNKNOWN" ;;
     esac
+}
+
+# Split "https://host:port/path" into "host port" (port defaults to 443)
+url_host_port() {
+    local url="$1"
+    local hostport="${url#*://}"
+    hostport="${hostport%%/*}"
+    hostport="${hostport##*@}"
+
+    local host port
+    case "${hostport}" in
+        \[*\]:*)                                     # [2001:db8::1]:8443
+            host="${hostport%]:*}"
+            port="${hostport##*]:}"
+            ;;
+        \[*\])                                       # [2001:db8::1]
+            host="${hostport%]}"
+            port="443"
+            ;;
+        *:*)                                         # host:8443
+            host="${hostport%:*}"
+            port="${hostport##*:}"
+            ;;
+        *)                                           # host
+            host="${hostport}"
+            port="443"
+            ;;
+    esac
+    printf '%s %s\n' "${host#\[}" "${port}"
+}
+
+# Read the notAfter field of the certificate served by host:port
+cert_not_after() {
+    local host="$1" port="$2"
+    local timeout_cmd=()
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd=(timeout "${SSL_TIMEOUT}")
+    elif command -v gtimeout >/dev/null 2>&1; then
+        timeout_cmd=(gtimeout "${SSL_TIMEOUT}")
+    fi
+
+    echo \
+        | ${timeout_cmd[@]+"${timeout_cmd[@]}"} \
+            openssl s_client -connect "${host}:${port}" -servername "${host}" 2>/dev/null \
+        | openssl x509 -noout -enddate 2>/dev/null \
+        | cut -d= -f2 || true
+}
+
+# Print "<days_left> <expiry_epoch>" for host:port, or nothing when the
+# certificate is unreachable/unparsable. days_left is negative once expired.
+cert_days_left() {
+    local host="$1" port="$2"
+    local not_after expiry_epoch now_epoch
+
+    not_after=$(cert_not_after "${host}" "${port}")
+    [[ -n "${not_after}" ]] || return 0
+
+    # Collapse the space-padded day ("Aug  6" -> "Aug 6") for BSD strptime
+    not_after="${not_after//  / }"
+
+    expiry_epoch=$(date -d "${not_after}" '+%s' 2>/dev/null) \
+        || expiry_epoch=$(date -j -f '%b %d %H:%M:%S %Y %Z' "${not_after}" '+%s' 2>/dev/null) \
+        || return 0
+
+    now_epoch=$(date '+%s')
+    printf '%s %s\n' "$(( (expiry_epoch - now_epoch) / 86400 ))" "${expiry_epoch}"
+}
+
+# Format an epoch as YYYY-MM-DD (GNU date, then BSD date)
+epoch_to_date() {
+    date -d "@$1" '+%Y-%m-%d' 2>/dev/null \
+        || date -r "$1" '+%Y-%m-%d' 2>/dev/null \
+        || echo "?"
 }
 
 # Send a plain-text message via signal-cli-rest-api (POST /v2/send)
@@ -139,18 +221,100 @@ alerts=$(echo "${alerts_json}" | jq -c --argjson excl "${excluded_ids}" --argjso
 total=$(echo "${alerts}" | grep -c . || true)
 
 # ---------------------------------------------------------------------------
+# TLS certificate of LIBRENMS_URL — warn below SSL_WARN_DAYS, escalate below
+# SSL_CRIT_DAYS. Certificates are renewed by hand through ssl-manager, so this
+# has to land in Signal early enough for someone to act on it.
+# ---------------------------------------------------------------------------
+
+ssl_status=""       # ok | warning | critical | expired | error
+ssl_host=""
+ssl_days=""
+ssl_expiry_date=""
+ssl_error=""
+
+if [[ "${SSL_CHECK}" == "1" && "${LIBRENMS_URL}" == https://* ]]; then
+    ssl_hostport=$(url_host_port "${LIBRENMS_URL}")
+    read -r ssl_host ssl_port <<<"${ssl_hostport}"
+    echo "Checking SSL certificate for ${ssl_host}:${ssl_port} ..." >&2
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        ssl_status="error"
+        ssl_error="openssl not installed"
+    else
+        ssl_probe=$(cert_days_left "${ssl_host}" "${ssl_port}")
+        if [[ -n "${ssl_probe}" ]]; then
+            read -r ssl_days ssl_expiry_epoch <<<"${ssl_probe}"
+            ssl_expiry_date=$(epoch_to_date "${ssl_expiry_epoch}")
+            if [[ "${ssl_days}" -lt 0 ]]; then
+                ssl_status="expired"
+            elif [[ "${ssl_days}" -le "${SSL_CRIT_DAYS}" ]]; then
+                ssl_status="critical"
+            elif [[ "${ssl_days}" -le "${SSL_WARN_DAYS}" ]]; then
+                ssl_status="warning"
+            else
+                ssl_status="ok"
+            fi
+        else
+            ssl_status="error"
+            ssl_error="certificate could not be read"
+        fi
+    fi
+fi
+
+# Short SSL marker for the summary line (empty unless action is needed)
+ssl_summary_suffix() {
+    case "${ssl_status}" in
+        warning|critical) echo "  ·  🔐 SSL: ${ssl_days}d" ;;
+        expired)          echo "  ·  🔐 SSL: expired" ;;
+        *)                : ;;
+    esac
+}
+
+# Full SSL block for the report body (empty unless action is needed)
+ssl_section() {
+    case "${ssl_status}" in
+        expired)
+            echo ""
+            echo "🚨 SSL CERT EXPIRED"
+            echo "  • ${ssl_host} expired on ${ssl_expiry_date} ($(( -ssl_days )) days ago)"
+            echo "  • ${SSL_MANAGER_HINT}"
+            ;;
+        critical)
+            echo ""
+            echo "🚨 SSL CERT EXPIRING"
+            echo "  • ${ssl_host} expires in ${ssl_days} days (${ssl_expiry_date})"
+            echo "  • ${SSL_MANAGER_HINT}"
+            ;;
+        warning)
+            echo ""
+            echo "⚠️  SSL CERT EXPIRING"
+            echo "  • ${ssl_host} expires in ${ssl_days} days (${ssl_expiry_date})"
+            echo "  • ${SSL_MANAGER_HINT}"
+            ;;
+        error)
+            echo ""
+            echo "❓ SSL CERT CHECK FAILED"
+            echo "  • ${ssl_host}: ${ssl_error}"
+            ;;
+        *)
+            : ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Format report (Signal-friendly: header + monospace code blocks)
 # ---------------------------------------------------------------------------
 
 timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 project_label="${PROJECT_GROUP:-ALL}"
+ssl_suffix=$(ssl_summary_suffix)
 
 report=$(
     echo "📡 NOC Alert Report"
     echo "🕐 ${timestamp}"
     echo "📂 Project: ${project_label}"
     echo ""
-    echo "🔴 Down: ${down_count}  ·  🚨 Alerts: ${total}"
+    echo "🔴 Down: ${down_count}  ·  🚨 Alerts: ${total}${ssl_suffix}"
 
     if [[ "${down_count}" -gt 0 ]]; then
         echo ""
@@ -183,7 +347,9 @@ report=$(
         done
     fi
 
-    if [[ "${total}" -eq 0 && "${down_count}" -eq 0 ]]; then
+    ssl_section
+
+    if [[ "${total}" -eq 0 && "${down_count}" -eq 0 && ( -z "${ssl_status}" || "${ssl_status}" == "ok" ) ]]; then
         echo ""
         echo "✅ All clear — no active alerts, no devices down."
     fi

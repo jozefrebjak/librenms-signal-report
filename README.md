@@ -21,9 +21,11 @@ On each run the script:
    and filters them out — polling-disabled boxes never make it into the report.
 3. Suppresses duplicate `Device Down [ICMP]` alerts for hosts already listed
    in the **DEVICES DOWN** section.
-4. Renders a plain-text, Signal-mobile-friendly report (no code fences — Signal
+4. Checks the TLS certificate served by `LIBRENMS_URL` and warns once it is
+   within `SSL_WARN_DAYS` (14) of expiry, escalating below `SSL_CRIT_DAYS` (7).
+5. Renders a plain-text, Signal-mobile-friendly report (no code fences — Signal
    does not render triple-backtick blocks) with emoji section headers.
-5. POSTs the message to `signal-cli-rest-api` `/v2/send`.
+6. POSTs the message to `signal-cli-rest-api` `/v2/send`.
 
 Example output (rendered in Signal):
 
@@ -32,7 +34,7 @@ Example output (rendered in Signal):
 🕐 2026-05-17 08:00:01
 📂 Project: WARP
 
-🔴 Down: 2  ·  🚨 Alerts: 1
+🔴 Down: 2  ·  🚨 Alerts: 1  ·  🔐 SSL: 12d
 
 🔴 DEVICES DOWN (2)
   • core-rtr-01 (icmp)
@@ -40,6 +42,10 @@ Example output (rendered in Signal):
 
 🚨 CRITICAL (1)
   • fw-01 → BGP Session Down (2026-05-17 07:42:11)
+
+⚠️  SSL CERT EXPIRING
+  • librenms.example.com expires in 12 days (2026-05-29)
+  • Manual renewal required via ssl-manager
 ```
 
 ## Requirements
@@ -49,19 +55,20 @@ Example output (rendered in Signal):
 | `bash` | 3.2+ (macOS system bash works; no `declare -A`, no `mapfile`) |
 | `curl` | Any recent version |
 | `jq` | 1.6+ |
+| `openssl` | Only for the SSL expiry check (`SSL_CHECK=1`, the default) |
 | LibreNMS | Reachable URL + API token with read access |
 | signal-cli-rest-api | **Self-hosted** instance, sender already registered |
 
 Install on Debian/Ubuntu:
 
 ```bash
-sudo apt update && sudo apt install -y curl jq
+sudo apt update && sudo apt install -y curl jq openssl
 ```
 
 Install on RHEL/Rocky:
 
 ```bash
-sudo dnf install -y curl jq
+sudo dnf install -y curl jq openssl
 ```
 
 ### Hosting signal-cli-rest-api
@@ -113,6 +120,39 @@ template.
 | `PROJECT_GROUP` |   | Label in the report header — does **not** filter |
 | `ALERT_STATE` |   | `0` recovered, `1` active (default), `2` acknowledged |
 | `ALERT_SEVERITY` |   | `critical` / `warning` / `ok`; empty = all |
+| `SSL_CHECK` |   | `1` check the LibreNMS certificate (default), `0` skip |
+| `SSL_WARN_DAYS` |   | First warning threshold in days (default `14`) |
+| `SSL_CRIT_DAYS` |   | Escalation threshold in days (default `7`) |
+| `SSL_TIMEOUT` |   | TLS handshake timeout in seconds (default `10`) |
+| `SSL_MANAGER_HINT` |   | Action line under the warning (default mentions `ssl-manager`) |
+
+### SSL certificate expiry
+
+The LibreNMS certificate is not renewed automatically — it has to be reissued
+by hand through ssl-manager — so every run checks it and puts the result in the
+same Signal message as the alerts:
+
+| Days left | Report |
+| --- | --- |
+| more than `SSL_WARN_DAYS` (14) | nothing (does not break **All clear**) |
+| `SSL_WARN_DAYS` … `SSL_CRIT_DAYS` | `⚠️  SSL CERT EXPIRING` + renewal hint |
+| `SSL_CRIT_DAYS` (7) or less | `🚨 SSL CERT EXPIRING` + renewal hint |
+| already past `notAfter` | `🚨 SSL CERT EXPIRED` + renewal hint |
+| handshake failed / no `openssl` | `❓ SSL CERT CHECK FAILED` |
+
+The check is skipped when `LIBRENMS_URL` is plain HTTP or `SSL_CHECK=0`. It
+reads `notAfter` from the leaf certificate via
+`openssl s_client -servername <host>` and needs `openssl` on the box (`timeout`
+or `gtimeout` is used to bound the handshake when available). Because the
+warning is repeated in every run below the threshold, a daily cron gives a
+daily reminder from day 14 down to renewal.
+
+Verify manually:
+
+```bash
+echo | openssl s_client -connect librenms.example.com:443 \
+  -servername librenms.example.com 2>/dev/null | openssl x509 -noout -enddate
+```
 
 ### Finding a group ID
 
